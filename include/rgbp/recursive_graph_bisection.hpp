@@ -13,6 +13,7 @@
 #include <tbb/parallel_reduce.h>
 
 #include <rgbp/util.hpp>
+#include <rgbp/varint.hpp>
 
 namespace constants {
 const int MAX_ITER = 20;
@@ -21,13 +22,27 @@ const uint64_t PARALLEL_SWITCH_DEPTH = 6;
 
 struct docid_node {
     uint64_t initial_id;
-    gsl::span<uint32_t> terms_;
-    gsl::span<uint32_t> freqs;
+    gsl::span<uint8_t> terms_;
+    gsl::span<uint8_t> freqs_;
     size_t num_terms;
     size_t num_terms_not_pruned;
     std::vector<uint32_t> terms() const
     {
-        return std::vector<uint32_t>(terms_.begin(), terms_.end());
+        std::vector<uint32_t> terms;
+        terms.resize(terms_.size() * 5);
+        auto n = bp::Varint::decode(terms_.data(), terms.data(), terms_.size());
+        terms.resize(n);
+        terms.shrink_to_fit();
+        return terms;
+    }
+    std::vector<uint32_t> freqs() const
+    {
+        std::vector<uint32_t> freqs;
+        freqs.resize(freqs_.size() * 5);
+        auto n = bp::Varint::decode(freqs_.data(), freqs.data(), freqs_.size());
+        freqs.resize(n);
+        freqs.shrink_to_fit();
+        return freqs;
     }
 };
 
@@ -44,7 +59,7 @@ void swap_nodes(docid_node* a, docid_node* b)
 {
     std::swap(a->initial_id, b->initial_id);
     std::swap(a->terms_, b->terms_);
-    std::swap(a->freqs, b->freqs);
+    std::swap(a->freqs_, b->freqs_);
     std::swap(a->num_terms, b->num_terms);
     std::swap(a->num_terms_not_pruned, b->num_terms_not_pruned);
 }
@@ -75,8 +90,8 @@ struct bipartite_graph {
     size_t num_docs;
     size_t num_docs_inc_empty;
     std::vector<docid_node> graph;
-    std::vector<uint32_t> doc_contents;
-    std::vector<uint32_t> doc_freqs;
+    std::vector<std::vector<uint8_t>> terms;
+    std::vector<std::vector<uint8_t>> freqs;
 };
 
 struct partition_t {
@@ -106,7 +121,6 @@ void compute_doc_sizes(const inverted_index& idx, std::vector<uint32_t>& doc_siz
 void create_graph(bipartite_graph& bg, const inverted_index& idx, uint32_t min_doc_id,
     uint32_t max_doc_id, size_t min_list_len)
 {
-    std::vector<uint32_t> doc_offset(idx.max_doc_id + 1, 0);
     for (size_t termid = 0; termid < idx.docids.size(); termid++) {
         const auto& dlist = idx.docids[termid];
         const auto& flist = idx.freqs[termid];
@@ -115,8 +129,8 @@ void create_graph(bipartite_graph& bg, const inverted_index& idx, uint32_t min_d
                 const auto& doc_id = dlist[pos];
                 if (min_doc_id <= doc_id && doc_id < max_doc_id) {
                     bg.graph[doc_id].initial_id = doc_id;
-                    bg.graph[doc_id].freqs[doc_offset[doc_id]] = flist[pos];
-                    bg.graph[doc_id].terms_[doc_offset[doc_id]++] = termid;
+                    bp::Varint::encode_single(termid, bg.terms[doc_id]);
+                    bp::Varint::encode_single(flist[pos], bg.freqs[doc_id]);
                 }
             }
         }
@@ -129,11 +143,15 @@ void create_graph(bipartite_graph& bg, const inverted_index& idx, uint32_t min_d
                 const auto& doc_id = dlist[pos];
                 if (min_doc_id <= doc_id && doc_id < max_doc_id) {
                     bg.graph[doc_id].initial_id = doc_id;
-                    bg.graph[doc_id].freqs[doc_offset[doc_id]] = flist[pos];
-                    bg.graph[doc_id].terms_[doc_offset[doc_id]++] = termid;
+                    bp::Varint::encode_single(termid, bg.terms[doc_id]);
+                    bp::Varint::encode_single(flist[pos], bg.freqs[doc_id]);
                 }
             }
         }
+    }
+    for (uint32_t doc = 0; doc < idx.num_docs; doc++) {
+        bg.graph[doc].terms_ = gsl::make_span(bg.terms[doc]);
+        bg.graph[doc].freqs_ = gsl::make_span(bg.freqs[doc]);
     }
 }
 
@@ -176,20 +194,14 @@ void init_bg(
         idx, min_list_len, doc_sizes, doc_sizes_non_pruned);
     tbb::parallel_for(
         tbb::blocked_range<uint32_t>(0, idx.max_doc_id + 1), sizes);
-    bg.doc_contents.resize(idx.num_postings);
-    bg.doc_freqs.resize(idx.num_postings);
+    bg.terms.resize(idx.max_doc_id + 1);
+    bg.freqs.resize(idx.max_doc_id + 1);
     bg.graph.resize(idx.max_doc_id + 1);
     bg.num_docs_inc_empty = idx.max_doc_id + 1;
 
-    size_t offset = 0;
     for (size_t i = 0; i < doc_sizes.size(); i++) {
-        bg.graph[i].terms_ = gsl::make_span(
-            bg.doc_contents.data() + offset, doc_sizes_non_pruned[i]);
-        bg.graph[i].freqs = gsl::make_span(
-            bg.doc_freqs.data() + offset, doc_sizes_non_pruned[i]);
         bg.graph[i].num_terms = doc_sizes[i];
         bg.graph[i].num_terms_not_pruned = doc_sizes_non_pruned[i];
-        offset += doc_sizes_non_pruned[i];
     }
     // Set ID for empty documents.
     //for (uint32_t doc_id = 0; doc_id < idx.num_docs; ++doc_id) {
@@ -266,10 +278,11 @@ void recreate_lists(const bipartite_graph& bg, inverted_index& idx,
     for (size_t docid = 0; docid < bg.num_docs_inc_empty; docid++) {
         const auto& doc = bg.graph[docid];
         auto terms = doc.terms();
+        auto freqs = doc.freqs();
         for (size_t i = 0; i < doc.num_terms_not_pruned; i++) {
             auto qid = terms[i];
             if (min_q_id <= qmap[qid] && qmap[qid] < max_q_id) {
-                auto freq = doc.freqs[i];
+                auto freq = freqs[i];
                 idx.docids[qid].push_back(docid);
                 idx.freqs[qid].push_back(freq);
                 dsizes[docid] += freq;
@@ -460,7 +473,6 @@ move_gains_t compute_move_gains(partition_t& P, size_t num_queries,
     tbb::parallel_for(tbb::blocked_range<size_t>(0, num_queries), f);
 
     // (2) compute gains from moving docs
-    // TODO: parallel
     compute_gains(P.V1, P.n1, before, left2right, gains.V1);
     compute_gains(P.V2, P.n2, before, right2left, gains.V2);
 
