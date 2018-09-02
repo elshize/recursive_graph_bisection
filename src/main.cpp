@@ -57,21 +57,23 @@ int main(int argc, char** argv)
     }
     tbb::task_scheduler_init init(threads);
 
-    auto invidx = read_ds2i_files(ds2i_prefix);
+    //auto invidx = read_ds2i_files(ds2i_prefix);
+    //bp::binary_collection invidx((ds2i_prefix + ".docs").c_str());
 
-    std::cout << "BEFORE average LogGap " << compute_avg_loggap(invidx)
-              << std::endl;
+    //std::cout << "BEFORE average LogGap " << compute_avg_loggap(invidx)
+    //          << std::endl;
 
-    auto reordered_invidx
-        = reorder_docids_graph_bisection(invidx, min_list_len);
+    //auto reordered_invidx
+    //    = reorder_docids_graph_bisection(invidx, min_list_len);
+    reorder_docids_graph_bisection(ds2i_prefix, min_list_len, ds2i_out_prefix);
 
-    std::cout << "AFTER average LogGap " << compute_avg_loggap(reordered_invidx)
-              << std::endl;
+    //std::cout << "AFTER average LogGap " << compute_avg_loggap(reordered_invidx)
+    //          << std::endl;
 
-    {
-        timer t("write ds2i files");
-        write_ds2i_files(reordered_invidx, ds2i_out_prefix);
-    }
+    //{
+    //    timer t("write ds2i files");
+    //    write_ds2i_files(reordered_invidx, ds2i_out_prefix);
+    //}
 
     return EXIT_SUCCESS;
 }

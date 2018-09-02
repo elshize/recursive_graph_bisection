@@ -2,6 +2,8 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <fstream>
+#include <iostream>
 #include <random>
 #include <string>
 #include <unordered_map>
@@ -12,6 +14,8 @@
 #include <tbb/parallel_for.h>
 #include <tbb/parallel_reduce.h>
 
+#include <rgbp/binary_collection.hpp>
+#include <rgbp/binary_freq_collection.hpp>
 #include <rgbp/util.hpp>
 #include <rgbp/varint.hpp>
 
@@ -22,10 +26,10 @@ const uint64_t PARALLEL_SWITCH_DEPTH = 6;
 
 struct docid_node {
     uint64_t initial_id;
-    gsl::span<uint8_t> terms_;
-    gsl::span<uint8_t> freqs_;
-    size_t num_terms;
-    size_t num_terms_not_pruned;
+    gsl::span<uint8_t> terms_{};
+    gsl::span<uint8_t> freqs_{};
+    size_t num_terms = 0;
+    size_t num_terms_not_pruned = 0;
     std::vector<uint32_t> terms() const
     {
         std::vector<uint32_t> terms;
@@ -129,6 +133,8 @@ void create_graph(bipartite_graph& bg, const inverted_index& idx, uint32_t min_d
                 const auto& doc_id = dlist[pos];
                 if (min_doc_id <= doc_id && doc_id < max_doc_id) {
                     bg.graph[doc_id].initial_id = doc_id;
+                    bg.graph[doc_id].num_terms++;
+                    bg.graph[doc_id].num_terms_not_pruned++;
                     bp::Varint::encode_single(termid, bg.terms[doc_id]);
                     bp::Varint::encode_single(flist[pos], bg.freqs[doc_id]);
                 }
@@ -143,6 +149,7 @@ void create_graph(bipartite_graph& bg, const inverted_index& idx, uint32_t min_d
                 const auto& doc_id = dlist[pos];
                 if (min_doc_id <= doc_id && doc_id < max_doc_id) {
                     bg.graph[doc_id].initial_id = doc_id;
+                    bg.graph[doc_id].num_terms_not_pruned++;
                     bp::Varint::encode_single(termid, bg.terms[doc_id]);
                     bp::Varint::encode_single(flist[pos], bg.freqs[doc_id]);
                 }
@@ -185,24 +192,31 @@ struct compute_doc_sizes_par {
 };
 
 void init_bg(
-    const inverted_index& idx, size_t min_list_len, bipartite_graph& bg)
+    const bp::binary_collection& idx, size_t min_list_len, bipartite_graph& bg)
 {
     timer t("init sizes");
-    std::vector<uint32_t> doc_sizes(idx.max_doc_id + 1, 0u);
-    std::vector<uint32_t> doc_sizes_non_pruned(idx.max_doc_id + 1, 0u);
-    compute_doc_sizes_par sizes(
-        idx, min_list_len, doc_sizes, doc_sizes_non_pruned);
-    tbb::parallel_for(
-        tbb::blocked_range<uint32_t>(0, idx.max_doc_id + 1), sizes);
-    bg.terms.resize(idx.max_doc_id + 1);
-    bg.freqs.resize(idx.max_doc_id + 1);
-    bg.graph.resize(idx.max_doc_id + 1);
-    bg.num_docs_inc_empty = idx.max_doc_id + 1;
-
-    for (size_t i = 0; i < doc_sizes.size(); i++) {
-        bg.graph[i].num_terms = doc_sizes[i];
-        bg.graph[i].num_terms_not_pruned = doc_sizes_non_pruned[i];
+    auto firstseq = *idx.begin();
+    if (firstseq.size() != 1) {
+        throw std::invalid_argument(
+            "First sequence should only contain number of documents");
     }
+    auto num_docs = *firstseq.begin();
+    //std::vector<uint32_t> doc_sizes(idx.max_doc_id + 1, 0u);
+    //std::vector<uint32_t> doc_sizes_non_pruned(idx.max_doc_id + 1, 0u);
+    //compute_doc_sizes_par sizes(
+    //    idx, min_list_len, doc_sizes, doc_sizes_non_pruned);
+    //tbb::parallel_for(
+    //    tbb::blocked_range<uint32_t>(0, idx.max_doc_id + 1), sizes);
+    bg.num_queries = std::distance(++idx.begin(), idx.end());
+    bg.terms.resize(num_docs);
+    bg.freqs.resize(num_docs);
+    bg.graph.resize(num_docs);
+    bg.num_docs_inc_empty = num_docs;
+
+    //for (size_t i = 0; i < doc_sizes.size(); i++) {
+    //    bg.graph[i].num_terms = doc_sizes[i];
+    //    bg.graph[i].num_terms_not_pruned = doc_sizes_non_pruned[i];
+    //}
     // Set ID for empty documents.
     //for (uint32_t doc_id = 0; doc_id < idx.num_docs; ++doc_id) {
     //    if (bg.graph[doc_id].initial_id != doc_id) {
@@ -212,13 +226,28 @@ void init_bg(
 }
 
 void create_forward_index(
-    const inverted_index& idx, size_t min_list_len, bipartite_graph& bg)
+    const bp::binary_collection& idx, size_t min_list_len, bipartite_graph& bg)
 {
     timer t("create forward index");
-    tbb::parallel_for(tbb::blocked_range<size_t>(0, idx.num_docs),
-        [&](const auto& range) {
-            create_graph(bg, idx, range.begin(), range.end(), min_list_len);
-        });
+    //tbb::parallel_for(tbb::blocked_range<size_t>(0, idx.num_docs),
+    //    [&](const auto& range) {
+    //        create_graph(bg, idx, range.begin(), range.end(), min_list_len);
+    //    });
+
+    /*** Sequential ***/
+    size_t termid = 0;
+    for (const auto& dlist : idx) {
+        for (const auto& doc_id : dlist) {
+            bg.graph[doc_id].initial_id = doc_id;
+            bg.graph[doc_id].num_terms++;
+            bg.graph[doc_id].num_terms_not_pruned++;
+            bp::Varint::encode_single(termid, bg.terms[doc_id]);
+        }
+    }
+    std::cout << "bg.num_docs: " << bg.num_docs << std::endl;
+    for (uint32_t doc = 0; doc < bg.num_docs_inc_empty; doc++) {
+        bg.graph[doc].terms_ = gsl::make_span(bg.terms[doc]);
+    }
 }
 
 size_t remove_empty(bipartite_graph& bg)
@@ -255,18 +284,18 @@ std::pair<size_t, size_t> calc_skipped_lists(
 }
 
 bipartite_graph construct_bipartite_graph(
-    inverted_index& idx, size_t min_list_len)
+    const std::string& index_path, size_t min_list_len)
 {
     timer t("construct_bipartite_graph");
+    bp::binary_collection idx((index_path + ".docs").c_str());
     bipartite_graph bg;
-    bg.num_queries = idx.size();
     init_bg(idx, min_list_len, bg);
     create_forward_index(idx, min_list_len, bg);
     size_t num_empty_docs = remove_empty(bg);
-    auto [num_skipped_lists, num_lists] = calc_skipped_lists(idx, min_list_len);
+    //auto [num_skipped_lists, num_lists] = calc_skipped_lists(idx, min_list_len);
     std::cout << "\tnum_empty docs = " << num_empty_docs << std::endl;
-    std::cout << "\tnum_skipped lists = " << num_skipped_lists << std::endl;
-    std::cout << "\tnum_lists = " << num_lists << std::endl;
+    //std::cout << "\tnum_skipped lists = " << num_skipped_lists << std::endl;
+    //std::cout << "\tnum_lists = " << num_lists << std::endl;
     std::cout << "\tnum_docs = " << bg.num_docs << std::endl;
     return bg;
 }
@@ -596,7 +625,7 @@ void recursive_bisection_np(progress_bar& progress, docid_node* G,
 }
 
 void recursive_bisection(progress_bar& progress, docid_node* G,
-    size_t num_queries, size_t n, uint64_t depth,uint64_t max_depth)
+    size_t num_queries, size_t n, uint64_t depth, uint64_t max_depth)
 {
     // (1) create the initial partition. O(n)
     auto partition = initial_partition(G, n);
@@ -610,11 +639,8 @@ void recursive_bisection(progress_bar& progress, docid_node* G,
         std::vector<float> right2left(num_queries);
 
         std::vector<uint8_t> query_changed(num_queries, 1);
-        {
-            // TODO: parallel
-            compute_deg(partition.V1, partition.n1, deg1);
-            compute_deg(partition.V2, partition.n2, deg2);
-        }
+        compute_deg(partition.V1, partition.n1, deg1);
+        compute_deg(partition.V2, partition.n2, deg2);
 
         // (3) perform bisection. constant number of iterations
         for (int cur_iter = 1; cur_iter <= constants::MAX_ITER; cur_iter++) {
@@ -687,14 +713,81 @@ void recursive_bisection(progress_bar& progress, docid_node* G,
     }
 }
 
-inverted_index reorder_docids_graph_bisection(
-    inverted_index& invidx, size_t min_list_len)
+auto get_mapping(const bipartite_graph& bg)
 {
-    auto num_lists = invidx.docids.size();
-    auto bg = construct_bipartite_graph(invidx, min_list_len);
+    std::vector<uint32_t> mapping(bg.num_docs);
+    uint32_t doc = 0;
+    for(auto&& i : bg.graph) {
+        mapping[i.initial_id] = doc++;
+    }
+    return mapping;
+};
 
-    // free up some space
-    invidx.clear();
+void emit(std::ostream& os, const uint32_t* vals, size_t n)
+{
+    os.write(reinterpret_cast<const char*>(vals), sizeof(*vals) * n);
+}
+
+void emit(std::ostream& os, uint32_t val)
+{
+    emit(os, &val, 1);
+}
+
+void reorder_inverted_index(const std::string& input_basename,
+    const std::string& output_basename, const std::vector<uint32_t>& mapping)
+{
+    std::ofstream output_mapping(output_basename + ".mapping");
+    emit(output_mapping, mapping.data(), mapping.size());
+
+    bp::binary_collection input_sizes((input_basename + ".sizes").c_str());
+    auto sizes = *input_sizes.begin();
+
+    auto num_docs = sizes.size();
+    std::vector<uint32_t> new_sizes(num_docs);
+    for (size_t i = 0; i < num_docs; ++i) {
+        new_sizes[i] = sizes.begin()[mapping[i]];
+    }
+
+    std::ofstream output_sizes(output_basename + ".sizes");
+    emit(output_sizes, sizes.size());
+    emit(output_sizes, new_sizes.data(), num_docs);
+
+
+    std::ofstream output_docs(output_basename + ".docs");
+    std::ofstream output_freqs(output_basename + ".freqs");
+    emit(output_docs, 1);
+    emit(output_docs, mapping.size());
+
+    bp::binary_freq_collection input(input_basename.c_str());
+
+    std::vector<std::pair<uint32_t, uint32_t>> pl;
+    //progress_bar bp("writing reordered", bg.num_docs);
+    for (const auto& seq: input) {
+
+        for (size_t i = 0; i < seq.docs.size(); ++i) {
+            pl.emplace_back(mapping[seq.docs.begin()[i]],
+                            seq.freqs.begin()[i]);
+        }
+
+        std::sort(pl.begin(), pl.end());
+
+        emit(output_docs, pl.size());
+        emit(output_freqs, pl.size());
+
+        for (const auto& posting: pl) {
+            emit(output_docs, posting.first);
+            emit(output_freqs, posting.second);
+        }
+        pl.clear();
+    }
+
+}
+
+void reorder_docids_graph_bisection(const std::string& index_path,
+    size_t min_list_len, const std::string& out_path)
+{
+    //auto num_lists = invidx.docids.size();
+    auto bg = construct_bipartite_graph(index_path, min_list_len);
 
     // make things faster by precomputing some logs
     log2_precomp.resize(256);
@@ -707,5 +800,6 @@ inverted_index reorder_docids_graph_bisection(
         progress_bar bp("recursive_bisection", bg.num_docs);
         recursive_bisection(bp, bg.graph.data(), bg.num_queries, bg.num_docs, 0, max_depth);
     }
-    return recreate_invidx(bg, num_lists);
+    auto mapping = get_mapping(bg);
+    reorder_inverted_index(index_path, out_path, mapping);
 }
